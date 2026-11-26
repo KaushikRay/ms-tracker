@@ -58,7 +58,8 @@ function migrate(o) {
 }
 function load() { try { const r = localStorage.getItem(KEY); return migrate(r ? JSON.parse(r) : null); } catch (e) { memFallback = true; return defaults(); } }
 let store = load();
-function save() { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) { memFallback = true; } }
+function persist() { try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) { memFallback = true; } }
+function save() { persist(); if (Sync.st.on) { clearTimeout(Sync.mt); Sync.mt = setTimeout(markChanges, 300); schedule(); } }
 
 /* ================= helpers ================= */
 const pad = n => String(n).padStart(2, '0');
@@ -231,6 +232,221 @@ function csv() {
   return lines.join('\n');
 }
 
+/* ================= optional cloud sync (end-to-end encrypted) ================= */
+const FB_CONFIG = {
+  apiKey: 'AIzaSyDuU3tcb8Ua5--EvcQG4jZWGMGcRG1L7oY',
+  authDomain: 'ms-tracking-93129.firebaseapp.com',
+  projectId: 'ms-tracking-93129',
+  storageBucket: 'ms-tracking-93129.firebasestorage.app',
+  messagingSenderId: '50518652472',
+  appId: '1:50518652472:web:8ba313d17b17d49ed558cd',
+};
+const FB_VER = '10.12.2';
+const SKEY = 'ms-tracker-sync';
+const RKEY = 'ms-tracker-redirect';
+const SYNC0 = () => ({ uid: null, email: null, on: false, seen: {}, h: {}, c: {}, lastS: 0, last: null });
+const Sync = { st: SYNC0(), key: null, remote: null, fb: null, cfg: null, busy: false, connecting: false, err: '', ui: { step: 'in', msg: '', email: '' }, afterSync: null, timer: null, pendingUid: null };
+try { Sync.st = Object.assign(SYNC0(), JSON.parse(localStorage.getItem(SKEY) || '{}')); } catch (e) {}
+function saveSync() { try { localStorage.setItem(SKEY, JSON.stringify(Sync.st)); } catch (e) {} }
+function notify(info) { if (typeof Sync.afterSync === 'function') Sync.afterSync(info || {}); }
+function schedule() { clearTimeout(Sync.timer); Sync.timer = setTimeout(() => { doSync(); }, 4000); }
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error('timeout'), { code: 'timeout' })), ms || 20000))]);
+
+/* ---- change tracking (hash per record) ---- */
+function stable(o) {
+  if (o === null || typeof o !== 'object') return JSON.stringify(o);
+  if (Array.isArray(o)) return '[' + o.map(stable).join(',') + ']';
+  return '{' + Object.keys(o).filter(k => o[k] !== undefined).sort().map(k => JSON.stringify(k) + ':' + stable(o[k])).join(',') + '}';
+}
+function hash(s) {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0, c; i < s.length; i++) { c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+function metaObj() { const s = Object.assign({}, store.settings); delete s.lastBackup; return { settings: s, questions: store.questions || '' }; }
+function localItems() {
+  const m = {};
+  for (const d in store.entries) m['d_' + d] = store.entries[d];
+  for (const e of store.events) m['e_' + e.id] = e;
+  m.meta = metaObj();
+  return m;
+}
+const isDirty = k => (Sync.st.seen[k] ?? null) !== (Sync.st.h[k] ?? null);
+function markChanges() {
+  const S = Sync.st; if (!S.on) return;
+  const items = localItems(), now = Date.now(), first = Object.keys(S.seen).length === 0;
+  for (const k in items) { const h = hash(stable(items[k])); if (S.seen[k] !== h) { S.seen[k] = h; S.c[k] = first ? 0 : now; } }
+  for (const k of Object.keys(S.seen)) { if (!(k in items) && S.seen[k] !== null) { S.seen[k] = null; S.c[k] = now; } }
+  saveSync();
+}
+function applyRemote(k, v) {
+  if (k === 'meta') {
+    if (v) { const lb = store.settings.lastBackup; store.settings = Object.assign(defaults().settings, v.settings || {}, { lastBackup: lb === undefined ? null : lb }); store.questions = v.questions || ''; }
+  } else if (k.startsWith('d_')) {
+    const d = k.slice(2); if (v) store.entries[d] = v; else delete store.entries[d];
+  } else if (k.startsWith('e_')) {
+    const id = k.slice(2); store.events = store.events.filter(e => e.id !== id); if (v) store.events.push(v);
+  }
+}
+
+/* ---- encryption (AES-GCM, key from passphrase via PBKDF2) ---- */
+const toB64 = buf => { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s); };
+const fromB64 = b => { const s = atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+async function deriveKey(pass, saltB64) {
+  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: fromB64(saltB64), iterations: 310000, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function encWith(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj)));
+  return { iv: toB64(iv), ct: toB64(ct) };
+}
+async function decWith(key, d) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(d.iv) }, key, fromB64(d.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+function idb() { return new Promise((res, rej) => { const r = indexedDB.open('ms-tracker-sync', 1); r.onupgradeneeded = () => r.result.createObjectStore('k'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function keyPut(uid, key) { try { const db = await idb(); await new Promise((res, rej) => { const t = db.transaction('k', 'readwrite'); t.objectStore('k').put(key, uid); t.oncomplete = res; t.onerror = () => rej(t.error); }); } catch (e) {} }
+async function keyGet(uid) { try { const db = await idb(); return await new Promise((res, rej) => { const q = db.transaction('k').objectStore('k').get(uid); q.onsuccess = () => res(q.result || null); q.onerror = () => rej(q.error); }); } catch (e) { return null; } }
+async function keyDel(uid) { try { const db = await idb(); await new Promise(res => { const t = db.transaction('k', 'readwrite'); t.objectStore('k').delete(uid); t.oncomplete = res; t.onerror = res; }); } catch (e) {} }
+
+/* ---- the sync itself ---- */
+async function doSync() {
+  const S = Sync.st;
+  if (!S.on || !Sync.key || !Sync.remote || Sync.busy) return null;
+  Sync.busy = true; Sync.err = '';
+  let pulled = 0, pushed = 0;
+  try {
+    markChanges();
+    const docs = await withTimeout(Sync.remote.list(S.lastS));
+    let maxS = S.lastS;
+    for (const d of docs) {
+      maxS = Math.max(maxS, d.s || 0);
+      let p; try { p = await decWith(Sync.key, d); } catch (e) { continue; }
+      const k = p.k, v = p.v === undefined ? null : p.v;
+      if (k !== d.id) continue;
+      if (isDirty(k) && (S.c[k] || 0) > (d.u || 0)) continue; // this device's change is newer: it gets pushed below
+      applyRemote(k, v);
+      const cur = localItems()[k];
+      const hh = cur === undefined ? null : hash(stable(cur));
+      S.seen[k] = hh; S.h[k] = hh; delete S.c[k]; pulled++;
+    }
+    persist();
+    const items = localItems();
+    for (const k of Object.keys(S.seen)) {
+      if (!isDirty(k)) continue;
+      const v = items[k] === undefined ? null : items[k];
+      const enc = await encWith(Sync.key, { k, v });
+      await withTimeout(Sync.remote.put(k, { iv: enc.iv, ct: enc.ct, u: S.c[k] || Date.now() }));
+      S.h[k] = S.seen[k]; delete S.c[k]; pushed++;
+    }
+    S.lastS = maxS; S.last = Date.now(); saveSync();
+    Sync.busy = false; notify({ pulled, pushed });
+    return { pulled, pushed };
+  } catch (e) {
+    Sync.err = fbErr(e); Sync.busy = false; saveSync(); notify({ pulled: 0, pushed: 0 });
+    return null;
+  }
+}
+
+/* ---- Firebase (loaded only when sync is used) ---- */
+function fbErr(e) {
+  const c = (e && e.code) || '';
+  const m = {
+    'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.',
+    'auth/user-not-found': 'No account with that email. Use Create account.', 'auth/email-already-in-use': 'That email already has an account. Use Sign in.',
+    'auth/weak-password': 'The password needs at least 6 characters.', 'auth/invalid-email': 'That email address looks wrong.',
+    'auth/network-request-failed': 'No internet connection.', 'auth/unauthorized-domain': 'Firebase has not authorised this site address yet. Add it under Authentication → Settings → Authorized domains.',
+    'auth/operation-not-allowed': 'This sign-in method is not enabled in Firebase yet.', 'auth/popup-closed-by-user': 'Sign-in was cancelled.',
+    'auth/cancelled-popup-request': 'Sign-in was cancelled.', 'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
+    'permission-denied': 'The database rules are blocking access. Check the rules in Firebase.', 'unavailable': 'Cannot reach the server. Check your connection.', 'timeout': 'The server did not answer in time. Check your connection.',
+  };
+  return m[c] || ('Something went wrong' + (c ? ' (' + c + ')' : '') + '.');
+}
+async function loadFb() {
+  if (Sync.fb) return Sync.fb;
+  const B = 'https://www.gstatic.com/firebasejs/' + FB_VER + '/';
+  const [app, auth, fs] = await Promise.all([import(B + 'firebase-app.js'), import(B + 'firebase-auth.js'), import(B + 'firebase-firestore.js')]);
+  const a = app.initializeApp(FB_CONFIG);
+  Sync.fb = { auth, fs, au: auth.getAuth(a), db: fs.initializeFirestore(a, { experimentalAutoDetectLongPolling: true }) };
+  return Sync.fb;
+}
+const waitAuth = fb => new Promise(res => { const un = fb.auth.onAuthStateChanged(fb.au, u => { un(); res(u); }); });
+function fsRemote(fb, uid) {
+  const { fs, db } = fb, col = () => fs.collection(db, 'users', uid, 'items'), cfg = () => fs.doc(db, 'users', uid, 'config', 'key');
+  return {
+    async list(sinceMs) {
+      const snap = await fs.getDocs(fs.query(col(), fs.where('s', '>', fs.Timestamp.fromMillis(sinceMs || 0))));
+      return snap.docs.map(x => { const d = x.data(); return { id: x.id, iv: d.iv, ct: d.ct, u: d.u, s: d.s && d.s.toMillis ? d.s.toMillis() : 0 }; });
+    },
+    async put(k, d) { await fs.setDoc(fs.doc(db, 'users', uid, 'items', k), { iv: d.iv, ct: d.ct, u: d.u, s: fs.serverTimestamp() }); },
+    async getConfig() { const s = await fs.getDoc(cfg()); return s.exists() ? s.data() : null; },
+    async putConfig(c) { await fs.setDoc(cfg(), c); },
+    async wipe() {
+      const snap = await fs.getDocs(col()); let batch = fs.writeBatch(db), n = 0;
+      for (const x of snap.docs) { batch.delete(x.ref); if (++n % 400 === 0) { await batch.commit(); batch = fs.writeBatch(db); } }
+      await batch.commit(); await fs.deleteDoc(cfg());
+    },
+  };
+}
+const isStandalone = () => { try { return !!(navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches)); } catch (e) { return false; } };
+async function signInGoogle() {
+  const fb = Sync.fb || await loadFb(); // preloaded when the Sync page opens, so the popup opens inside the tap
+  const p = new fb.auth.GoogleAuthProvider();
+  try { return (await fb.auth.signInWithPopup(fb.au, p)).user; }
+  catch (e) {
+    if (['auth/popup-blocked', 'auth/operation-not-supported-in-this-environment', 'auth/web-storage-unsupported'].includes(e.code)) {
+      try { localStorage.setItem(RKEY, '1'); } catch (x) {}
+      await fb.auth.signInWithRedirect(fb.au, p); return null;
+    }
+    throw e;
+  }
+}
+async function afterSignIn(user) {
+  Sync.remote = fsRemote(Sync.fb, user.uid); Sync.pendingUid = user.uid; Sync.pendingEmail = user.email || '';
+  Sync.cfg = await withTimeout(Sync.remote.getConfig());
+  Sync.ui.step = Sync.cfg ? 'pass-existing' : 'pass-new'; Sync.ui.msg = '';
+}
+async function setPassphrase(pass, create) {
+  const uid = Sync.pendingUid || Sync.st.uid; let key;
+  if (create) {
+    const salt = toB64(crypto.getRandomValues(new Uint8Array(16)));
+    key = await deriveKey(pass, salt);
+    const chk = await encWith(key, { ok: 'ms-tracker' });
+    const cfg = { salt, iv: chk.iv, ct: chk.ct };
+    await withTimeout(Sync.remote.putConfig(cfg)); Sync.cfg = cfg;
+  } else {
+    key = await deriveKey(pass, Sync.cfg.salt);
+    try { const p = await decWith(key, Sync.cfg); if (!p || p.ok !== 'ms-tracker') return false; } catch (e) { return false; }
+  }
+  if (Sync.st.uid !== uid) Sync.st = Object.assign(SYNC0(), { uid, email: Sync.pendingEmail || Sync.st.email });
+  Sync.st.on = true; Sync.st.email = Sync.pendingEmail || Sync.st.email; Sync.key = key; saveSync();
+  await keyPut(uid, key);
+  return true;
+}
+async function bootSync() {
+  const S = Sync.st; if (!S.on) return;
+  Sync.connecting = true; Sync.err = '';
+  try {
+    const fb = await withTimeout(loadFb(), 15000), user = await waitAuth(fb);
+    if (!user || user.uid !== S.uid) { Sync.ui.step = 'in'; Sync.err = 'Signed out. Sign in again to resume sync.'; return; }
+    Sync.remote = fsRemote(fb, user.uid);
+    Sync.key = await keyGet(user.uid);
+    if (!Sync.key) { Sync.cfg = await withTimeout(Sync.remote.getConfig()); Sync.ui.step = 'pass-existing'; Sync.pendingUid = user.uid; Sync.err = 'Enter your passphrase again to resume sync.'; return; }
+    Sync.connecting = false; await doSync();
+  } catch (e) { Sync.err = fbErr(e); }
+  finally { Sync.connecting = false; notify(); }
+}
+async function signOutLocal() {
+  const uid = Sync.st.uid;
+  try { if (Sync.fb) await Sync.fb.auth.signOut(Sync.fb.au); } catch (e) {}
+  if (uid) await keyDel(uid);
+  Sync.st = SYNC0(); saveSync(); Sync.key = null; Sync.remote = null; Sync.cfg = null; Sync.err = '';
+  Sync.ui = { step: 'in', msg: '', email: '' };
+}
+
 /* ================= UI ================= */
 if (typeof document !== 'undefined') {
   let tab = 'home', flow = null, more = 'menu';
@@ -261,6 +477,7 @@ if (typeof document !== 'undefined') {
     if (!keep) window.scrollTo(0, 0);
   }
 
+  const syncBadge = () => { const S = Sync.st; if (!S.on) return ''; return `<small class="sb">☁️ ${Sync.err ? 'Sync paused' : S.last ? 'Synced ' + new Date(S.last).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : 'Syncing…'}</small>`; };
   /* ---------- HOME ---------- */
   function vHome() {
     const t = todayStr(), e = entry(t), ed = eveningDate(), ee = entry(ed);
@@ -284,7 +501,7 @@ if (typeof document !== 'undefined') {
     const nEntries = Object.keys(store.entries).length;
     const lb = store.settings.lastBackup;
     const needBackup = nEntries >= 7 && (!lb || lb < addDays(t, -14));
-    return `<header class="top"><div><small>${fmtDate(t, true)}</small><h1>${greet}</h1></div></header>
+    return `<header class="top"><div><small>${fmtDate(t, true)}</small><h1>${greet}</h1></div>${syncBadge()}</header>
     ${memFallback ? '<div class="warn">Storage is blocked here, so entries will not be kept. Open the app from your own link or Home Screen icon.</div>' : ''}
     ${needBackup ? `<div class="warn">Your last backup was ${lb ? fmtDate(lb) : 'never'}. <button class="lnk" data-a="more" data-v="settings">Back up now</button></div>` : ''}
     ${h < 12 ? mCard + eCard : eCard + mCard}
@@ -461,7 +678,8 @@ if (typeof document !== 'undefined') {
     if (more === 'events') return back + vEvents();
     if (more === 'settings') return back + vSettings();
     if (more === 'help') return back + vHelp();
-    const items = [['report', '📄', 'Doctor report', 'Summary to copy, print or save as PDF'], ['events', '🗓️', 'Episodes & appointments', 'Relapses, visits, MRI dates, medication changes'], ['settings', '⚙️', 'Settings & backup', 'Choose symptoms, stress reasons, back up your data'], ['help', '❓', 'Help', 'Install on iPhone/iPad, voice tips, privacy']];
+    if (more === 'sync') return back + vSync();
+    const items = [['report', '📄', 'Doctor report', 'Summary to copy, print or save as PDF'], ['events', '🗓️', 'Episodes & appointments', 'Relapses, visits, MRI dates, medication changes'], ['settings', '⚙️', 'Settings & backup', 'Choose symptoms, stress reasons, back up your data'], ['sync', '☁️', 'Sync between devices', 'Optional, end-to-end encrypted'], ['help', '❓', 'Help', 'Install on iPhone/iPad, voice tips, privacy']];
     return `<h1>More</h1><section class="card list">${items.map(([v, i, n, d]) => `<button class="li" data-a="more" data-v="${v}"><span class="em">${i}</span><div><b>${n}</b><small>${d}</small></div><span>›</span></button>`).join('')}</section>
       <p class="foot">MS Tracker v2 · a personal tracking aid, not medical advice.</p>`;
   }
@@ -505,8 +723,52 @@ if (typeof document !== 'undefined') {
       <section class="card"><h2>Install on iPhone or iPad</h2><ol><li>Open your app link in <b>Safari</b>.</li><li>Tap Share, then <b>Add to Home Screen</b>.</li><li>Always open the app from that icon. It keeps its own data, separate from Safari tabs.</li></ol></section>
       <section class="card"><h2>Daily routine</h2><p>Do the <b>morning check-in</b> right after you get up (morning pain and sleep), and the <b>evening check-in</b> before bed (the day's symptoms, stress and triggers). Missed one? Fill it in later from History.</p></section>
       <section class="card"><h2>Voice tips</h2><p>Say a symptom with a number: "fatigue 6", "morning pain eight", "no numbness". Add "slept 5 hours", "stressed about work", "hot day", "took my meds" or "missed my dose". Tap <b>Review</b> to check before saving. If the Dictate button doesn't work, tap the box and use the microphone on your keyboard.</p></section>
-      <section class="card"><h2>Privacy</h2><p>Nothing leaves your device. There's no account and no server, and the app makes no network requests with your data.</p></section>
+      <section class="card"><h2>Privacy</h2><p>By default nothing leaves your device: no account, no server. If you turn on Sync, your records are encrypted on your device with your passphrase before they are uploaded, so the cloud only stores scrambled data and the dates of your entries.</p></section>
       <section class="card"><h2>Important</h2><p>This app helps you notice patterns and talk to your doctor. It doesn't diagnose or give medical advice. For a new or worsening symptom lasting over 24 hours, contact your neurology team. In an emergency, call your local emergency number.</p></section>`;
+  }
+
+  const fmtWhen = ms => ms ? new Date(ms).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'never';
+  function vSync() {
+    const S = Sync.st, ui = Sync.ui, on = S.on && Sync.key && Sync.remote;
+    const m = ui.msg || Sync.err, msg = m ? `<div class="warn">${esc(m)}</div>` : '';
+    if (Sync.connecting && !on) return '<h1>Sync</h1><section class="card"><p>Connecting…</p></section>';
+    if (on) return `<h1>Sync</h1>${msg}<section class="card"><h2>Sync is on ✓</h2>
+      <div class="kv"><span>Account</span><span>${esc(S.email || '')}</span></div>
+      <div class="kv"><span>Last synced</span><span>${fmtWhen(S.last)}</span></div>
+      <div class="row2"><button class="btn pri" data-a="ssync">${Sync.busy ? 'Syncing…' : 'Sync now'}</button></div>
+      <p class="hint">Changes sync a few seconds after you make them, and whenever you open the app. On your other device, sign in with the same account and enter the same passphrase.</p></section>
+      <section class="card"><h2>What the cloud can see</h2><p class="hint">Entries, notes and settings are encrypted on this device before upload. The cloud service can see that records exist and their dates, not what is in them.</p></section>
+      <section class="card"><h2>Turn off</h2>
+        <div class="row2"><button class="btn" data-a="soff">${armed.soff ? 'Tap again to confirm' : 'Turn off sync on this device'}</button></div>
+        <p class="hint">Keeps your data on this device and in the cloud.</p>
+        <div class="row2"><button class="btn danger" data-a="swipe">${armed.swipe ? 'Tap again to delete cloud data' : 'Delete cloud data'}</button></div>
+        <p class="hint">Removes your encrypted records from the cloud and turns sync off here. Data on your devices stays. Turn sync off on your other devices too.</p></section>`;
+    if (ui.step === 'pass-new') return `<h1>Sync</h1>${msg}<section class="card"><h2>Create a passphrase</h2>
+      <p class="hint">Signed in as ${esc(Sync.pendingEmail || S.email || '')}. This passphrase encrypts your records before they leave this device. You'll enter it once on each device.</p>
+      <input type="password" id="pp1" autocomplete="new-password" placeholder="Passphrase (at least 8 characters)"><div style="height:8px"></div>
+      <input type="password" id="pp2" autocomplete="new-password" placeholder="Repeat passphrase">
+      <p class="hint"><b>If you forget it, your cloud copy cannot be recovered.</b> Your device copy and backup files still work. Use something you will remember, not your account password.</p>
+      <button class="btn pri big" data-a="spass-new">Create and start sync</button></section>`;
+    if (ui.step === 'pass-existing') return `<h1>Sync</h1>${msg}<section class="card"><h2>Enter your passphrase</h2>
+      <p class="hint">Use the passphrase you created when you first turned on sync.</p>
+      <input type="password" id="pp1" autocomplete="current-password" placeholder="Passphrase">
+      <p class="hint">On the first sync from this device, entries already in the cloud replace entries for the same days on this device.</p>
+      <button class="btn pri big" data-a="spass-ex">Unlock and sync</button></section>`;
+    return `<h1>Sync</h1>${msg}<section class="card"><h2>Keep iPhone and iPad in step</h2>
+      <p class="hint">Sign in to sync your entries between devices. Records are encrypted on your device before upload. Sync is optional: the app works fully without it.</p>
+      <button class="btn pri big" data-a="sgoogle">Continue with Google</button>
+      ${isStandalone() ? '<p class="hint">If Google sign-in fails inside the Home Screen app, use email below.</p>' : ''}
+      <p class="hint" style="text-align:center;margin:14px 0 8px">or use email</p>
+      <input type="email" id="fbemail" autocomplete="email" placeholder="Email" value="${esc(ui.email || '')}"><div style="height:8px"></div>
+      <input type="password" id="fbpass" autocomplete="current-password" placeholder="Password (at least 6 characters)">
+      <div class="row2"><button class="btn" data-a="semail-in">Sign in</button><button class="btn" data-a="semail-up">Create account</button></div>
+      <button class="lnk" data-a="sforgot">Forgot password?</button></section>`;
+  }
+  function renderSync() { if (!flow && tab === 'more' && more === 'sync') render(true); }
+  async function busySync(fn) {
+    Sync.ui.msg = ''; Sync.err = ''; Sync.connecting = true; renderSync();
+    try { await fn(); } catch (e) { Sync.ui.msg = fbErr(e); }
+    Sync.connecting = false; renderSync();
   }
 
   /* ---------- dictation ---------- */
@@ -566,7 +828,7 @@ if (typeof document !== 'undefined') {
       case 'hmet': histMetric = v; render(true); break;
       case 'irange': insRange = +v; render(true); break;
       case 'ikey': insKey = v; render(true); break;
-      case 'more': tab = 'more'; more = v; render(); break;
+      case 'more': tab = 'more'; more = v; if (v === 'sync' && !Sync.fb) loadFb().catch(() => {}); render(); break;
       case 'rr': repDays = +v; render(true); break;
       case 'copyrep': copy(reportText(repDays)); break;
       case 'print': try { window.print(); } catch (x) { toast('Printing not available here. Use Copy.'); } break;
@@ -577,9 +839,24 @@ if (typeof document !== 'undefined') {
       case 'addsym': { const n = $('#newsym').value.trim(); if (!n) return; if (allSyms().some(s => s.n.toLowerCase() === n.toLowerCase())) { toast('Already in the list'); return; }
         const k = 'c' + Date.now().toString(36); store.settings.customSyms.push({ k, n }); store.settings.tracked.push(k); save(); toast('Added'); render(true); break; }
       case 'delsym': if (arm('sym' + v)) { store.settings.customSyms = store.settings.customSyms.filter(s => s.k !== v); store.settings.tracked = store.settings.tracked.filter(k => k !== v); save(); render(true); } break;
+      case 'sgoogle': busySync(async () => { const u = await signInGoogle(); if (u) await afterSignIn(u); }); break;
+      case 'semail-in': case 'semail-up': { const em = (($('#fbemail') || {}).value || '').trim(), pw = ($('#fbpass') || {}).value || ''; Sync.ui.email = em;
+        if (!em || !pw) { Sync.ui.msg = 'Enter your email and password.'; render(true); break; }
+        busySync(async () => { const fb = await loadFb(); const c = a === 'semail-up' ? await fb.auth.createUserWithEmailAndPassword(fb.au, em, pw) : await fb.auth.signInWithEmailAndPassword(fb.au, em, pw); await afterSignIn(c.user); }); break; }
+      case 'sforgot': { const em = (($('#fbemail') || {}).value || '').trim(); Sync.ui.email = em; if (!em) { Sync.ui.msg = 'Type your email first.'; render(true); break; }
+        busySync(async () => { const fb = await loadFb(); await fb.auth.sendPasswordResetEmail(fb.au, em); Sync.ui.msg = 'If that email has an account, a reset link is on its way.'; }); break; }
+      case 'spass-new': { const p1 = ($('#pp1') || {}).value || '', p2 = ($('#pp2') || {}).value || '';
+        if (p1.length < 8) { Sync.ui.msg = 'The passphrase needs at least 8 characters.'; render(true); break; }
+        if (p1 !== p2) { Sync.ui.msg = 'The two passphrases do not match.'; render(true); break; }
+        busySync(async () => { await setPassphrase(p1, true); await doSync(); }); break; }
+      case 'spass-ex': { const p1 = ($('#pp1') || {}).value || ''; if (!p1) { Sync.ui.msg = 'Enter your passphrase.'; render(true); break; }
+        busySync(async () => { const ok = await setPassphrase(p1, false); if (!ok) { Sync.ui.msg = 'That passphrase is not correct.'; return; } await doSync(); }); break; }
+      case 'ssync': doSync().then(renderSync); render(true); break;
+      case 'soff': if (arm('soff')) { busySync(async () => { await signOutLocal(); }); } break;
+      case 'swipe': if (arm('swipe')) { busySync(async () => { await Sync.remote.wipe(); await signOutLocal(); }); } break;
       case 'bjson': download('ms-tracker-backup-' + todayStr() + '.json', JSON.stringify(store, null, 1), 'application/json'); break;
       case 'bcsv': download('ms-tracker-' + todayStr() + '.csv', csv(), 'text/csv'); break;
-      case 'erase': if (arm('erase')) { store = defaults(); save(); toast('All data erased'); render(); } break;
+      case 'erase': if (Sync.st.on) { toast('Turn sync off first (More → Sync), so the cloud copy is not erased too.'); break; } if (arm('erase')) { store = defaults(); save(); toast('All data erased'); render(); } break;
     }
   }
 
@@ -588,13 +865,24 @@ if (typeof document !== 'undefined') {
   root.addEventListener('change', ev => {
     if (ev.target.id !== 'imp') return; const f = ev.target.files[0]; if (!f) return;
     const r = new FileReader();
-    r.onload = () => { try { const o = JSON.parse(r.result); if (!o || typeof o.entries !== 'object') throw 0; store = migrate(o); save(); toast('Backup restored'); render(); } catch (x) { toast('That file is not a valid backup'); } };
+    r.onload = () => { try { const o = JSON.parse(r.result); if (!o || typeof o.entries !== 'object') throw 0; if (Sync.st.on) { const b = migrate(o), cur = store; b.entries = Object.assign({}, cur.entries, b.entries); const ids = new Set(b.events.map(x => x.id)); b.events = b.events.concat(cur.events.filter(x => !ids.has(x.id))); b.settings.lastBackup = cur.settings.lastBackup; store = b; save(); toast('Backup merged with your current data'); } else { store = migrate(o); save(); toast('Backup restored'); } render(); } catch (x) { toast('That file is not a valid backup'); } };
     r.readAsText(f);
   });
   root.addEventListener('keydown', ev => { if (ev.key === 'Enter' && (ev.target.id === 'newwhy' || ev.target.id === 'newsym')) { ev.preventDefault(); act(ev.target.id === 'newwhy' ? 'addwhy' : 'addsym'); } });
   document.querySelectorAll('nav button').forEach(b => b.onclick = () => { tab = b.dataset.tab; if (tab === 'more') more = 'menu'; if (tab === 'history') selDay = selDay || todayStr(); render(); });
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   try { if ('serviceWorker' in navigator && /^https?:/.test(location.protocol) && !/claude|usercontent/.test(location.hostname)) navigator.serviceWorker.register('sw.js').catch(() => {}); } catch (e) {}
+  Sync.afterSync = info => {
+    if (flow) return;
+    const typing = /^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || '');
+    if (tab === 'more' && more === 'sync') render(true); else if (!typing && (tab === 'home' || (info && info.pulled))) render(true);
+  };
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible' || !Sync.st.on) return; if (!Sync.key) { if (!Sync.connecting) bootSync(); } else if (Date.now() - (Sync.st.last || 0) > 60000) doSync(); });
+  let redirected = false; try { redirected = !!localStorage.getItem(RKEY); } catch (e) {}
+  if (redirected) {
+    tab = 'more'; more = 'sync'; Sync.connecting = true;
+    (async () => { try { const fb = await loadFb(); const r = await fb.auth.getRedirectResult(fb.au); if (r && r.user) await afterSignIn(r.user); else Sync.ui.msg = 'Google sign-in did not complete. Try again, or use email.'; } catch (e) { Sync.ui.msg = fbErr(e); } try { localStorage.removeItem(RKEY); } catch (e) {} Sync.connecting = false; notify(); })();
+  } else if (Sync.st.on) setTimeout(bootSync, 600);
   render();
 }
-if (typeof module !== 'undefined') module.exports = { parseText, patterns, reportText, csv, migrate, _set: s => { store = migrate(s); }, _get: () => store };
+if (typeof module !== 'undefined') module.exports = { parseText, patterns, reportText, csv, migrate, Sync, SYNC0, doSync, markChanges, localItems, deriveKey, encWith, decWith, hash, stable, persist, setPassphrase, fbErr, _set: s => { store = migrate(s); }, _get: () => store };
