@@ -93,6 +93,7 @@ textarea{resize:vertical}
 .list{padding:4px 16px}.li{display:flex;align-items:center;gap:14px;width:100%;padding:14px 0;border:0;border-bottom:1px solid var(--bd);background:none;text-align:left}.li:last-child{border-bottom:0}
 .li div{flex:1}.li small{display:block;color:var(--mut);font-size:14px}.li>span:last-child{color:var(--mut);font-size:22px}
 .backl{margin-bottom:-4px}
+.chip.on{background:var(--acc);color:#fff}button.chip{border:0;font:inherit;font-size:15px;color:inherit}button.chip.on{color:#fff}.sub2{font-size:16px;margin:18px 0 4px}code{background:var(--acc2);padding:1px 5px;border-radius:5px;font-size:13px}
 .res{display:block;width:100%;text-align:left;border:0;border-top:1px solid var(--bd);background:none;color:inherit;padding:10px 0;font:inherit}.res:first-of-type{border-top:0}.res .rd{display:block;font-weight:600}.res .rv{display:block;font-size:14px;margin-top:2px}.res .rn{display:block;font-size:13px;color:var(--mut);margin-top:2px}
 .item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--bd)}.item:first-of-type{border-top:0}
 .x{border:0;background:none;color:var(--warn);font-size:16px;padding:8px;white-space:nowrap}
@@ -159,6 +160,16 @@ const REASON_KW = [
   ['Loneliness', /\b(lonely|loneliness|isolated)\b/],
   ['Caregiving', /\b(caregiving|caring for)\b/],
 ];
+const ACTS = [
+  { k: 'run', n: 'Run', i: '🏃', re: /\b(run|ran|running|jog|jogged|jogging)\b(?! (?:out|into|late|low|errands?|a fever))/ },
+  { k: 'walk', n: 'Walk', i: '🚶', re: /\b(walked|went for a walk|long walk|a walk|walks)\b/ },
+  { k: 'gym', n: 'Gym / strength', i: '🏋️', re: /\b(gym|weights|strength training|workout|worked out)\b/ },
+  { k: 'yoga', n: 'Yoga / stretch', i: '🧘', re: /\b(yoga|pilates|stretching)\b/ },
+  { k: 'swim', n: 'Swim', i: '🏊', re: /\b(swim|swam|swimming)\b/ },
+  { k: 'cycle', n: 'Cycle', i: '🚴', re: /\b(cycling|cycled|bike|biked|bike ride)\b/ },
+  { k: 'physio', n: 'Physio', i: '🩺', re: /\b(physio\w*)\b/ },
+];
+const actName = k => (ACTS.find(a => a.k === k) || { n: k }).n;
 const EVENT_TYPES = { relapse: 'New or worse symptom', appointment: 'Appointment', mri: 'MRI / scan', med: 'Medication change', other: 'Other' };
 const NUMW = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 const SLEEPQ = { poor: 'Poor', ok: 'OK', good: 'Good' };
@@ -238,7 +249,9 @@ function parseText(raw, syms) {
   else if (/\b(slept well|good sleep|good night|slept great)\b/.test(t)) { out.sleepQ = 'good'; out.found.push('Good sleep'); }
   if ((m = t.match(/stress(?:ed)?[^0-9.,;]{0,15}(\d{1,2})\b/))) { out.stress = clamp(+m[1]); out.found.push('Stress ' + out.stress); }
   if (/\b(hot|heat|overheated|sauna|heatwave)\b/.test(t) && !/\b(no|not)\s+(hot|heat)/.test(t)) { out.heat = true; out.found.push('Heat'); }
-  if (/\b(exercis\w*|workout|gym|walked|swam|swim|yoga|jogged|cycling|physio\w*)\b/.test(t)) { out.exercise = true; out.found.push('Active'); }
+  const acts = ACTS.filter(a => a.re.test(t)).map(a => a.k);
+  if (acts.length) { out.acts = acts; out.exercise = true; out.found.push(...acts.map(actName)); }
+  else if (/\b(exercis\w*|workout)\b/.test(t)) { out.exercise = true; out.found.push('Active'); }
   if (/\b(missed|forgot|skipped)\b[^.]{0,25}\b(meds|medication|injection|tablets?|dose|pills?)\b/.test(t)) { out.meds = false; out.found.push('Missed a dose'); }
   else if (/\b(took|taken|had)\b[^.]{0,12}\b(meds|medication|injection|tablets?|dose|pills?)\b/.test(t)) { out.meds = true; out.found.push('Took medication'); }
   if (/\b(sick|ill|cold|flu|fever|infection|uti|covid)\b/.test(t) && !/\bno\s+(fever|infection)/.test(t)) { out.ill = true; out.found.push('Cold or infection'); }
@@ -256,6 +269,7 @@ function applyParsed(p, date, text) {
   const e = ensure(date);
   Object.assign(e.s, p.s);
   ['sleep', 'sleepQ', 'stress', 'heat', 'exercise', 'meds', 'ill', 'alcohol'].forEach(k => { if (p[k] !== undefined) e[k] = p[k]; });
+  if (p.acts) e.acts = Array.from(new Set([...(e.acts || []), ...p.acts]));
   if (p.why) e.stressWhy = Array.from(new Set([...(e.stressWhy || []), ...p.why]));
   const t = (text || '').trim();
   if (t && !(e.note || '').includes(t)) e.note = ((e.note || '') + (e.note ? '\n' : '') + t).trim();
@@ -565,6 +579,35 @@ async function signOutLocal() {
   Sync.ui = { step: 'in', msg: '', email: '' };
 }
 
+/* ================= Apple Health import (pasted Shortcut output) ================= */
+function actFromType(t) {
+  t = t.toLowerCase();
+  return /run|jog/.test(t) ? 'run' : /walk|hik/.test(t) ? 'walk' : /cycl|bik/.test(t) ? 'cycle' : /swim/.test(t) ? 'swim' : /yoga|pilates|flexib|stretch|mind/.test(t) ? 'yoga' : /strength|weight|gym|functional|core/.test(t) ? 'gym' : null;
+}
+function importHealth(text) {
+  const wk = {}, sl = {}; let bad = 0, nW = 0;
+  String(text || '').split(/\r?\n/).forEach(line => {
+    line = line.trim(); if (!line) return;
+    const m = line.match(/^(\d{4}-\d{2}-\d{2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\s*[|;,\t]\s*([^|;,\t]+?)\s*(?:[|;,\t]\s*(\d+(?:[.,]\d+)?))?\s*(?:min\w*|h|hrs?|hours?)?\s*$/i);
+    if (!m) { bad++; return; }
+    const d = m[1], type = m[2].trim(), val = m[3] == null ? null : +m[3].replace(',', '.');
+    if (/sleep/i.test(type)) { if (val == null) { bad++; return; } sl[d] = (sl[d] || 0) + (val > 24 ? val / 60 : val); return; }
+    const mins = val == null ? null : (val >= 300 ? val / 60 : val);
+    const k = actFromType(type) || 'other';
+    wk[d] = wk[d] || {}; wk[d][k] = (wk[d][k] || 0) + (mins || 0); nW++;
+  });
+  const days = new Set([...Object.keys(wk), ...Object.keys(sl)]);
+  if (!days.size) return { ok: false, msg: 'I could not read any lines. Each line should look like: 2026-11-26 | Running | 35' };
+  Object.keys(wk).forEach(d => {
+    const e = ensure(d); e.exercise = true; e.acts = e.acts || []; e.actMin = e.actMin || {};
+    Object.keys(wk[d]).forEach(k => { if (k === 'other') return; if (!e.acts.includes(k)) e.acts.push(k); if (wk[d][k]) e.actMin[k] = Math.round(wk[d][k]); });
+  });
+  Object.keys(sl).forEach(d => { const e = ensure(d); if (e.sleep == null) e.sleep = Math.round(Math.min(14, sl[d]) * 2) / 2; });
+  save();
+  const ns = Object.keys(sl).length;
+  return { ok: true, msg: `Imported ${nW} workout${nW === 1 ? '' : 's'} and ${ns} sleep night${ns === 1 ? '' : 's'} across ${days.size} day${days.size === 1 ? '' : 's'}.${bad ? ' ' + bad + ' line(s) skipped.' : ''}` };
+}
+
 /* ================= search (local, rule-based) ================= */
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 const RUN_RE = /\b(run|ran|running|runs|jog|jogged|jogging)\b/;
@@ -621,8 +664,9 @@ function scan(part) {
   use(/\b(hot|heat|heatwave|sauna|bath|shower)\b/, () => add('heat', e => !!e.heat));
   use(/\b(ill|sick|illness|infection|infected|fever|flu|cold|covid|uti)\b/, () => add('cold or infection', e => !!e.ill));
   use(/\b(alcohol|drank|drink|drinks|drinking|wine|beer|booze)\b/, () => add('alcohol', e => !!e.alcohol));
-  if (RUN_RE.test(t)) { t = t.replace(new RegExp(RUN_RE.source, 'g'), ' '); add('running (from your notes)', e => RUN_RE.test(String(e.note || '').toLowerCase())); }
-  else use(/\b(exercis\w*|work(?:ed)? out|workout|gym|yoga|swim\w*|swam|cycl\w*|bik(?:e|ed|ing)|physio\w*|pilates|hik(?:e|ed|ing)|went for a walk|walked|active)\b/, () => add('exercise', e => !!e.exercise || EXERCISE_RE.test(String(e.note || '').toLowerCase())));
+  const hitActs = ACTS.filter(a => new RegExp(a.re.source).test(t));
+  if (hitActs.length) hitActs.forEach(a => { t = t.replace(new RegExp(a.re.source, 'g'), ' '); add(a.n.toLowerCase().split(' ')[0], e => (e.acts || []).includes(a.k) || a.re.test(String(e.note || '').toLowerCase())); });
+  else use(/\b(exercis\w*|work(?:ed)? out|workout|gym|yoga|swim\w*|swam|cycl\w*|bik(?:e|ed|ing)|physio\w*|pilates|hik(?:e|ed|ing)|went for a walk|walked|active)\b/, () => add('exercise', e => !!e.exercise || !!(e.acts || []).length || EXERCISE_RE.test(String(e.note || '').toLowerCase())));
   // threshold + qualifier for symptoms
   use(new RegExp('(?:^|\\s)' + opRe.replace('(', '(').slice(0, -1) + '|>=|<=|>|<)\\s*(\\d+(?:\\.\\d+)?)'), m => { o.thr = { op: OPS[m[1]], n: +m[2] }; });
   use(/\b(very bad|really bad|terrible|awful|severe|bad|high|intense)\b/, () => { o.qual = 'high'; });
@@ -714,7 +758,7 @@ function runSearch(raw, today) {
 
 /* ================= UI ================= */
 if (typeof document !== 'undefined') {
-  let tab = 'home', flow = null, more = 'menu';
+  let tab = 'home', flow = null, more = 'menu', healthText = '', healthMsg = '';
   let histMonth = todayStr().slice(0, 7), histMetric = 'morning', selDay = todayStr();
   let insRange = 30, insKey = 'morning', repDays = 30, voiceText = '', sqText = '', voiceDraft = null, evPreset = 'relapse', evDate = null, toastT;
   const armed = {};
@@ -862,6 +906,8 @@ if (typeof document !== 'undefined') {
         <div class="tiles2">${FACTORS.map(f => `<button class="tile ${e[f.k] ? 'on' : ''}" data-a="fac" data-v="${f.k}"><span>${f.i}</span>${f.n}<small>${f.d}</small></button>`).join('')}
         <button class="tile ${e.meds === true ? 'on' : ''}" data-a="meds" data-v="1"><span>💊</span>Took my medication<small>As planned</small></button>
         <button class="tile ${e.meds === false ? 'on warnon' : ''}" data-a="meds" data-v="0"><span>⏰</span>Missed a dose<small>Or took it late</small></button></div>
+        <h2 class="sub2">Did you move today? Tap what you did.</h2>
+        <div class="chips">${ACTS.map(a => `<button class="chip ${(e.acts || []).includes(a.k) ? 'on' : ''}" data-a="act" data-v="${a.k}">${a.i} ${a.n}</button>`).join('')}</div>
         <button class="btn pri big" data-a="next">Next</button>`;
     } else if (st.t === 'note') {
       body = `<h1 class="q">Anything else about today?</h1><p class="sub">Food, activities, how you felt. Optional.</p>
@@ -871,7 +917,7 @@ if (typeof document !== 'undefined') {
     } else {
       const items = flow.kind === 'morning'
         ? [e.s.morning != null ? `Morning pain ${e.s.morning} · ${word(e.s.morning)}` : null, e.sleep != null ? `Slept ${hrsFmt(e.sleep)} h${e.sleepQ ? ', ' + SLEEPQ[e.sleepQ].toLowerCase() : ''}` : null]
-        : [...eveningSyms().filter(s => e.s[s.k] != null).map(s => `${s.n} ${e.s[s.k]}`), e.stress != null ? `Stress ${e.stress}` : null, ...(e.stressWhy || []), ...FACTORS.filter(f => e[f.k]).map(f => f.n), e.meds === true ? 'Medication taken' : e.meds === false ? 'Missed a dose' : null];
+        : [...eveningSyms().filter(s => e.s[s.k] != null).map(s => `${s.n} ${e.s[s.k]}`), e.stress != null ? `Stress ${e.stress}` : null, ...(e.stressWhy || []), ...FACTORS.filter(f => e[f.k]).map(f => f.n), ...(e.acts || []).map(k => actName(k) + (e.actMin && e.actMin[k] ? ' ' + Math.round(e.actMin[k]) + ' min' : '')), e.meds === true ? 'Medication taken' : e.meds === false ? 'Missed a dose' : null];
       body = `<div class="done"><div class="big-ok">✓</div><h1 class="q">Saved</h1>
         <div class="chips c">${items.filter(Boolean).map(x => `<span class="chip">${esc(x)}</span>`).join('') || '<span class="hint">Nothing rated</span>'}</div>
         ${flow.kind === 'morning' ? '<p class="sub">See you this evening.</p>' : '<p class="sub">Rest well.</p>'}
@@ -909,7 +955,7 @@ if (typeof document !== 'undefined') {
       if (e.sleep != null || e.sleepQ) rows.push(`<div class="kv"><span>Sleep the night before</span><span>${e.sleep != null ? hrsFmt(e.sleep) + ' h' : ''}${e.sleepQ ? ' · ' + SLEEPQ[e.sleepQ] : ''}</span></div>`);
       if (e.stress != null) rows.push(`<div class="kv"><span>Stress</span><b style="${cellBg(e.stress)}">${e.stress}</b></div>`);
       inner = rows.join('');
-      const tags = [...(e.stressWhy || []).map(w => 'Stress: ' + w), ...FACTORS.filter(f => e[f.k]).map(f => f.n), e.meds === true ? 'Medication taken' : e.meds === false ? 'Missed a dose' : null].filter(Boolean);
+      const tags = [...(e.stressWhy || []).map(w => 'Stress: ' + w), ...FACTORS.filter(f => e[f.k]).map(f => f.n), ...(e.acts || []).map(k => actName(k) + (e.actMin && e.actMin[k] ? ' ' + Math.round(e.actMin[k]) + ' min' : '')), e.meds === true ? 'Medication taken' : e.meds === false ? 'Missed a dose' : null].filter(Boolean);
       if (tags.length) inner += `<div class="chips">${tags.map(x => `<span class="chip">${esc(x)}</span>`).join('')}</div>`;
       if (e.note) inner += `<p class="note">${esc(e.note)}</p>`;
     }
@@ -964,9 +1010,25 @@ if (typeof document !== 'undefined') {
     if (more === 'settings') return back + vSettings();
     if (more === 'help') return back + vHelp();
     if (more === 'sync') return back + vSync();
-    const items = [['report', '📄', 'Doctor report', 'Summary to copy, print or save as PDF'], ['events', '🗓️', 'Episodes & appointments', 'Relapses, visits, MRI dates, medication changes'], ['settings', '⚙️', 'Settings & backup', 'Choose symptoms, stress reasons, back up your data'], ['sync', '☁️', 'Sync between devices', 'Optional, end-to-end encrypted'], ['help', '❓', 'Help', 'Install on iPhone/iPad, voice tips, privacy']];
+    if (more === 'health') return back + vHealth();
+    const items = [['report', '📄', 'Doctor report', 'Summary to copy, print or save as PDF'], ['events', '🗓️', 'Episodes & appointments', 'Relapses, visits, MRI dates, medication changes'], ['settings', '⚙️', 'Settings & backup', 'Choose symptoms, stress reasons, back up your data'], ['health', '❤️', 'Import from Apple Health', 'Workouts and sleep via a Shortcut'], ['sync', '☁️', 'Sync between devices', 'Optional, end-to-end encrypted'], ['help', '❓', 'Help', 'Install on iPhone/iPad, voice tips, privacy']];
     return `<h1>More</h1><section class="card list">${items.map(([v, i, n, d]) => `<button class="li" data-a="more" data-v="${v}"><span class="em">${i}</span><div><b>${n}</b><small>${d}</small></div><span>›</span></button>`).join('')}</section>
       <p class="foot">MS Tracker v2 · a personal tracking aid, not medical advice.</p>`;
+  }
+  function vHealth() {
+    return `<h1>Apple Health import</h1>
+      <section class="card"><p class="hint">Web apps cannot read Apple Health directly, so a small Shortcut on your iPhone copies your recent workouts and sleep, and you paste them here. It takes a few seconds, is free, and the data stays on your devices.</p>
+      <textarea id="htext" rows="5" data-in="htext" placeholder="Paste the copied lines here">${esc(healthText)}</textarea>
+      <div class="row2"><button class="btn" data-a="hpaste">📋 Paste</button><button class="btn pri" data-a="hdo">Import</button></div>
+      ${healthMsg ? `<p class="sum">${esc(healthMsg)}</p>` : ''}</section>
+      <section class="card"><h2>Set up the Shortcut once</h2>
+      <ol><li>Open the <b>Shortcuts</b> app, tap <b>+</b>, name it "Health to MS Tracker".</li>
+      <li>Add <b>Find Health Samples</b>: Type = <b>Workouts</b>, Start Date is in the last <b>14 days</b>, sorted by Start Date.</li>
+      <li>Add <b>Repeat with Each</b> over the samples. Inside it add a <b>Text</b> action: <code>Start Date | Type | Duration</code> using the variable chips. Set Start Date to a <b>Custom</b> format <code>yyyy-MM-dd</code> and Duration in <b>minutes</b>.</li>
+      <li>Optional: add a second <b>Find Health Samples</b> for <b>Sleep</b> with lines like <code>2026-11-26 | Sleep | 7.5</code> (hours).</li>
+      <li>After the loop add <b>Combine Text</b> (New Line), then <b>Copy to Clipboard</b>.</li>
+      <li>Run it, come back here, tap <b>Paste</b>, then <b>Import</b>. Importing twice is safe.</li></ol>
+      <p class="hint">One line per item, like <code>2026-11-26 | Running | 35</code>. Commas and semicolons also work. Workouts become activities, and sleep fills the sleep hours when they are empty.</p></section>`;
   }
   function vReport() {
     return `<h1>Doctor report</h1>
@@ -1075,6 +1137,7 @@ if (typeof document !== 'undefined') {
   function onInput(kind, el) {
     if (kind === 'vtext') voiceText = el.value;
     else if (kind === 'qtext') sqText = el.value;
+    else if (kind === 'htext') healthText = el.value;
     else if (kind === 'note' && flow) { ensure(flow.date).note = el.value; save(); }
     else if (kind === 'questions') { store.questions = el.value; save(); const r = $('#rep'); if (r) r.textContent = reportText(repDays); }
   }
@@ -1101,9 +1164,12 @@ if (typeof document !== 'undefined') {
       case 'why': { e.stressWhy = e.stressWhy || []; const i = e.stressWhy.indexOf(v); if (i >= 0) e.stressWhy.splice(i, 1); else e.stressWhy.push(v); save(); render(true); break; }
       case 'addwhy': addReason($('#newwhy').value, flow ? flow.date : null); break;
       case 'delwhy': store.settings.customReasons = store.settings.customReasons.filter(r => r !== v); save(); render(true); break;
+      case 'act': { e.acts = e.acts || []; const i = e.acts.indexOf(v); if (i >= 0) e.acts.splice(i, 1); else { e.acts.push(v); e.exercise = true; } save(); render(true); break; }
       case 'fac': e[v] = !e[v]; save(); render(true); break;
       case 'meds': { const val = v === '1'; e.meds = e.meds === val ? undefined : val; save(); render(true); break; }
       case 'dict': dictate(v); break;
+      case 'hpaste': (async () => { try { healthText = await navigator.clipboard.readText(); } catch (x) { toast('Paste blocked. Long-press the box and choose Paste.'); return; } render(true); })(); break;
+      case 'hdo': { const q = $('#htext'); if (q) healthText = q.value; const r = importHealth(healthText); healthMsg = r.msg; if (r.ok) healthText = ''; render(true); break; }
       case 'dosearch': { const q = $('#qtext'); if (q) sqText = q.value; render(true); break; }
       case 'sex': sqText = SEARCH_EX[+v]; render(true); break;
       case 'vreview': { const txt = ($('#vtext') || {}).value || voiceText; voiceText = txt; if (!txt.trim()) { toast('Say or type something first'); return; }
@@ -1173,7 +1239,7 @@ if (typeof document !== 'undefined') {
   } else if (Sync.st.on) setTimeout(bootSync, 600);
   render();
 }
-if (typeof module !== 'undefined') module.exports = { parseQuery: runSearch, runSearch, _store: () => store, parseText, patterns, reportText, csv, migrate, Sync, SYNC0, doSync, markChanges, localItems, deriveKey, encWith, decWith, hash, stable, persist, setPassphrase, fbErr, _set: s => { store = migrate(s); }, _get: () => store };
+if (typeof module !== 'undefined') module.exports = { importHealth, parseQuery: runSearch, runSearch, _store: () => store, parseText, patterns, reportText, csv, migrate, Sync, SYNC0, doSync, markChanges, localItems, deriveKey, encWith, decWith, hash, stable, persist, setPassphrase, fbErr, _set: s => { store = migrate(s); }, _get: () => store };
 
 </script>
 </body>
