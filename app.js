@@ -447,11 +447,158 @@ async function signOutLocal() {
   Sync.ui = { step: 'in', msg: '', email: '' };
 }
 
+/* ================= search (local, rule-based) ================= */
+const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+const RUN_RE = /\b(run|ran|running|runs|jog|jogged|jogging)\b/;
+const EXERCISE_RE = /\b(exercis\w*|work(?:ed)? out|workout|gym|yoga|swim\w*|swam|cycl\w*|bik(?:e|ed|ing)|physio\w*|pilates|hik(?:e|ed|ing)|went for a walk|walked|run|ran|running|jog\w*)\b/;
+const OPS = { 'above': '>', 'over': '>', 'more than': '>', 'greater than': '>', 'higher than': '>', '>': '>', 'at least': '>=', '>=': '>=', 'below': '<', 'under': '<', 'less than': '<', 'lower than': '<', '<': '<', 'at most': '<=', '<=': '<=' };
+const STOPW = new Set(('when did i the a an and then my me was were is are how what which days day times time have had has with of on in at to for it that this those these any all show find search entries entry about get got went do does').split(' '));
+const cmp = (v, op, n) => op === '>' ? v > n : op === '>=' ? v >= n : op === '<' ? v < n : v <= n;
+function metricName(k) { return k === 'overall' ? 'Day average' : k === 'stress' ? 'Stress' : symDef(k).n; }
+
+function parseRange(q, today) {
+  let from = null, to = null, label = null;
+  const T = new Date(today + 'T12:00:00');
+  const grab = (re, fn) => { const m = q.match(re); if (!m) return false; q = q.replace(re, ' '); fn(m); return true; };
+  const unit = { day: 1, week: 7, month: 30, year: 365 };
+  grab(/\b(?:in |during |over |within )?(?:the )?(?:last|past) (\d+) (day|week|month|year)s?\b/, m => { const n = +m[1] * unit[m[2]]; from = addDays(today, -(n - 1)); to = today; label = `last ${m[1]} ${m[2]}${+m[1] === 1 ? '' : 's'}`; })
+    || grab(/\b(?:in |during |over |within )?(?:the )?(?:last|past) (week|month|year)\b/, m => { from = addDays(today, -(unit[m[1]] - 1)); to = today; label = `last ${m[1]}`; })
+    || grab(/\bthis (week|month|year)\b/, m => { to = today; from = m[1] === 'week' ? addDays(today, -6) : m[1] === 'month' ? today.slice(0, 7) + '-01' : today.slice(0, 4) + '-01-01'; label = 'this ' + m[1]; })
+    || grab(new RegExp('\\b(?:in |during |since )?(' + MONTHS.join('|') + ')\\b'), m => {
+      const mi = MONTHS.indexOf(m[1]); let Y = T.getFullYear(); if (mi > T.getMonth()) Y--;
+      from = Y + '-' + pad(mi + 1) + '-01'; to = ymd(new Date(Y, mi + 1, 0)); label = m[1][0].toUpperCase() + m[1].slice(1) + ' ' + Y;
+    });
+  return { q, from, to, label };
+}
+
+function scan(part) {
+  let t = ' ' + part + ' ';
+  const o = { tests: [], labels: [], metrics: [], thr: null, qual: null, kw: [], kwUsed: false };
+  const use = (re, f) => { const m = t.match(re); if (!m) return false; t = t.replace(re, ' '); f(m); return true; };
+  const add = (label, fn) => { o.labels.push(label); o.tests.push(fn); };
+  const H = '\\s*(\\d+(?:\\.\\d+)?)\\s*(?:hours?|hrs?|h)\\b';
+  const opRe = '(above|over|more than|greater than|higher than|at least|at most|below|under|less than|lower than)';
+  // sleep hours
+  use(new RegExp('(?:slept|sleep)[^.]{0,12}?' + opRe + H), m => { const op = OPS[m[1]], n = +m[2]; add(`sleep ${op} ${n} h`, e => e.sleep != null && cmp(e.sleep, op, n)); })
+    || use(new RegExp(opRe + H + '\\s*(?:of )?sleep'), m => { const op = OPS[m[1]], n = +m[2]; add(`sleep ${op} ${n} h`, e => e.sleep != null && cmp(e.sleep, op, n)); });
+  use(/\b(poor|bad|terrible|awful|little|short|disturbed)\s+sleep\b|\bslept\s+(badly|poorly|little)\b|\bsleepless\b|\bcouldn'?t sleep\b/, () => add('poor sleep', e => e.sleepQ === 'poor' || (e.sleep != null && e.sleep < 6)))
+    || use(/\b(good|great|solid|well)\s+sleep\b|\bslept\s+well\b/, () => add('good sleep', e => e.sleepQ === 'good' || (e.sleep != null && e.sleep >= 8)));
+  // medication
+  use(/\b(?:missed|forgot(?:ten)?|skipped|miss|forget|skip)\b[^.]{0,25}?\b(?:dose|doses|meds|medication|medications|medicine|pills?|injection|tablets?)\b|\b(?:didn'?t|did not|never) take\b[^.]{0,15}?\b(?:meds|medication|medicine|pills?|dose)\b/, () => add('missed a dose', e => e.meds === false))
+    || use(/\b(?:took|taken|take)\b[^.]{0,15}?\b(?:meds|medication|medicine|pills?|dose)\b/, () => add('took medication', e => e.meds === true));
+  // events
+  use(/\b(relapses?|flare[- ]?ups?|appointments?|mri|scans?|medication changes?|med changes?)\b/, m => {
+    const w = m[1], ty = /relapse|flare/.test(w) ? 'relapse' : /appoint/.test(w) ? 'appointment' : /mri|scan/.test(w) ? 'mri' : 'med';
+    add(EVENT_TYPES[ty].toLowerCase(), (e, d) => store.events.some(x => x.date === d && x.type === ty));
+  });
+  // stress (+ reasons)
+  const st = use(/\b(stress(?:ed|ful)?)\b/, () => {});
+  if (st) {
+    const why = [];
+    REASON_KW.forEach(([name, re]) => { const g = new RegExp(re.source, 'g'); if (g.test(t)) { why.push(name); t = t.replace(new RegExp(re.source, 'g'), ' '); } });
+    const customs = (store.settings.customReasons || []).filter(r => t.includes(r.toLowerCase())); customs.forEach(r => { why.push(r); t = t.replace(r.toLowerCase(), ' '); });
+    if (why.length) { o.why = why; add('stress: ' + why.join(' / '), e => (e.stressWhy || []).some(w => why.includes(w))); } else o.metrics.push('stress');
+  }
+  // factors
+  use(/\b(hot|heat|heatwave|sauna|bath|shower)\b/, () => add('heat', e => !!e.heat));
+  use(/\b(ill|sick|illness|infection|infected|fever|flu|cold|covid|uti)\b/, () => add('cold or infection', e => !!e.ill));
+  use(/\b(alcohol|drank|drink|drinks|drinking|wine|beer|booze)\b/, () => add('alcohol', e => !!e.alcohol));
+  if (RUN_RE.test(t)) { t = t.replace(new RegExp(RUN_RE.source, 'g'), ' '); add('running (from your notes)', e => RUN_RE.test(String(e.note || '').toLowerCase())); }
+  else use(/\b(exercis\w*|work(?:ed)? out|workout|gym|yoga|swim\w*|swam|cycl\w*|bik(?:e|ed|ing)|physio\w*|pilates|hik(?:e|ed|ing)|went for a walk|walked|active)\b/, () => add('exercise', e => !!e.exercise || EXERCISE_RE.test(String(e.note || '').toLowerCase())));
+  // threshold + qualifier for symptoms
+  use(new RegExp('(?:^|\\s)' + opRe.replace('(', '(').slice(0, -1) + '|>=|<=|>|<)\\s*(\\d+(?:\\.\\d+)?)'), m => { o.thr = { op: OPS[m[1]], n: +m[2] }; });
+  use(/\b(very bad|really bad|terrible|awful|severe|bad|high|intense)\b/, () => { o.qual = 'high'; });
+  use(/\b(mild|low|slight)\b/, () => { o.qual = 'low'; });
+  // symptoms (longest synonym first)
+  const pairs = []; allSyms().forEach(s => s.syn.concat([s.n.toLowerCase()]).forEach(w => pairs.push([w, s.k])));
+  pairs.sort((a, b) => b[0].length - a[0].length);
+  pairs.forEach(([w, k]) => { const re = new RegExp('\\b' + reEsc(w) + '\\b'); if (re.test(t)) { t = t.replace(new RegExp('\\b' + reEsc(w) + '\\b', 'g'), ' '); if (!o.metrics.includes(k)) o.metrics.push(k); } });
+  if (/\bmorning\b/.test(t) && !o.metrics.includes('morning')) { o.morningWord = true; t = t.replace(/\bmorning\b/g, ' '); }
+  o.kw = t.split(/[^a-z']+/).filter(w => w.length > 2 && !STOPW.has(w));
+  return o;
+}
+
+function runSearch(raw, today) {
+  today = today || todayStr();
+  let q = normalize(raw).replace(/[?!.]+\s*$/, '').trim();
+  if (!q) return { ok: false, msg: 'Type or say what you are looking for.' };
+  const rg = parseRange(q, today); q = rg.q;
+  let rank = null, latest = false, offset = 0, morning = false;
+  q = q.replace(/\b(worst|highest|most severe|best|lowest|least severe)\b/, m => { rank = /best|lowest|least/.test(m) ? 'asc' : 'desc'; return ' '; });
+  q = q.replace(/\b(last time|most recent|latest|when was (?:my|the) last)\b/, () => { latest = true; return ' '; });
+  let aPart = q, oPart = '';
+  const dm = /\b(?:the )?(?:(?:next|following) (day|morning)|(day|morning) after)\b/;
+  if (dm.test(q)) { const m = q.match(dm); offset = 1; morning = (m[1] || m[2]) === 'morning'; q = q.replace(dm, ' '); aPart = q; }
+  else { const m = q.match(/^(.+?)\s+(?:after|following)\s+(.+)$/); if (m) { offset = 1; oPart = m[1]; aPart = m[2]; } }
+  if (!oPart) { const m = aPart.match(/^(.*?)\b(?:and |then |,)?\s*(?:how (?:was|were|did|is|are|bad)|what (?:was|were))\b(.*)$/); if (m && m[1].trim()) { aPart = m[1]; oPart = m[3]; } }
+  let A = scan(aPart), O = scan(oPart);
+  if (!A.tests.length && !A.metrics.length && !A.kw.length && (O.metrics.length || O.tests.length)) { A = O; O = scan(''); }
+  if (rank && !A.metrics.length && O.metrics.length) { A = Object.assign(A, { metrics: O.metrics }); O = scan(''); }
+  if (O.morningWord) morning = true;
+  // build anchor tests
+  const tests = A.tests.slice(), labels = A.labels.slice();
+  let plain = false;
+  A.metrics.forEach(k => {
+    const nm = metricName(k);
+    if (A.thr) { tests.push(e => { const v = metricVal(e, k); return v != null && cmp(v, A.thr.op, A.thr.n); }); labels.push(`${nm} ${A.thr.op} ${A.thr.n}`); }
+    else if (A.qual === 'high' || k === 'stress' && !A.why) { const n = k === 'stress' ? 6 : 6; tests.push(e => { const v = metricVal(e, k); return v != null && v >= n; }); labels.push(`${nm} ${n}+`); }
+    else if (A.qual === 'low') { tests.push(e => { const v = metricVal(e, k); return v != null && v <= 3; }); labels.push(`${nm} 0-3`); }
+    else { tests.push(e => metricVal(e, k) != null); labels.push(`${nm} recorded`); plain = true; }
+  });
+  if (!tests.length && A.kw.length) {
+    const stems = A.kw.map(w => w.replace(/(ing|ed|es|s)$/, '')).filter(w => w.length > 2);
+    if (stems.length) { tests.push((e, d) => { const hay = (String(e.note || '') + ' ' + (e.stressWhy || []).join(' ') + ' ' + store.events.filter(x => x.date === d).map(x => x.text).join(' ')).toLowerCase(); return stems.every(s => hay.includes(s)); }); labels.push('mentions "' + A.kw.join(' ') + '"'); }
+  }
+  if (!tests.length) return { ok: false, msg: 'I could not tell what to look for. Try a symptom, a trigger or a word from your notes, for example "worst fatigue last month".' };
+  // outcome
+  let om = O.metrics.slice();
+  if (!om.length && morning) om = ['morning'];
+  if (!om.length && offset > 0) om = ['morning', 'overall'];
+  if (!om.length && !offset && A.metrics.length) om = [];
+  const oThr = O.thr || (O.qual === 'high' ? { op: '>=', n: 6 } : null);
+  // candidate dates
+  const set = new Set(Object.keys(store.entries)); store.events.forEach(x => set.add(x.date));
+  let dates = Array.from(set).sort().filter(d => (!rg.from || d >= rg.from) && (!rg.to || d <= rg.to));
+  let hits = dates.filter(d => tests.every(f => f(entry(d) || { s: {} }, d)));
+  const sortKey = A.metrics[0];
+  if (rank && sortKey) { hits = hits.filter(d => metricVal(entry(d), sortKey) != null).sort((a, b) => (rank === 'desc' ? 1 : -1) * (metricVal(entry(b), sortKey) - metricVal(entry(a), sortKey)) || (a < b ? 1 : -1)).slice(0, 5); }
+  else if (latest) hits = hits.slice(-1);
+  const total = hits.length;
+  const limited = !rank && hits.length > 40; if (limited) hits = hits.slice(-40);
+  const rows = hits.map(d => {
+    const e = entry(d) || { s: {} };
+    const r = { date: d, own: A.metrics.map(k => ({ k, n: metricName(k), v: metricVal(e, k) })).filter(x => x.v != null), note: String(e.note || '').split('\n')[0].slice(0, 70) };
+    if (offset > 0) {
+      const nd = addDays(d, offset), ne = entry(nd);
+      r.after = { date: nd, vals: om.map(k => ({ k, n: metricName(k), v: ne ? metricVal(ne, k) : null })), hit: null };
+      if (oThr && om.length) { const vs = r.after.vals.filter(x => x.v != null); r.after.hit = vs.length ? vs.some(x => cmp(x.v, oThr.op, oThr.n)) : null; }
+    }
+    return r;
+  });
+  const sum = [];
+  const rangeTxt = rg.label ? ' in the ' + (/^\w+ \d{4}$/.test(rg.label) ? rg.label : rg.label) : '';
+  sum.push(rank ? `${rank === 'desc' ? 'Highest' : 'Lowest'} ${metricName(sortKey)}${rg.label ? ', ' + rg.label : ''}:` : `${total} day${total === 1 ? '' : 's'} matched${rg.label ? ' (' + rg.label + ')' : ''}${limited ? ', showing the latest 40' : ''}.`);
+  if (offset > 0 && rows.length) {
+    om.forEach(k => {
+      const av = rows.map(r => r.after.vals.find(x => x.k === k).v).filter(v => v != null);
+      const allv = dates.map(d => metricVal(entry(d), k)).filter(v => v != null);
+      if (av.length && allv.length) sum.push(`The day after: ${metricName(k)} averaged ${f1(mean(av))} (${av.length} day${av.length === 1 ? '' : 's'} with data) vs ${f1(mean(allv))} on all days.${av.length < 4 ? ' Too few days to say much.' : ''}`);
+      else sum.push(`The day after: no ${metricName(k).toLowerCase()} recorded yet.`);
+    });
+    if (oThr) { const k = rows.filter(r => r.after.hit != null); sum.push(`${k.filter(r => r.after.hit).length} of ${k.length} were followed by ${om.map(metricName).join(' / ').toLowerCase()} ${oThr.op} ${oThr.n}.`); }
+  } else if (!offset && plain && rows.length) {
+    const k = A.metrics[0], v = hits.map(d => metricVal(entry(d), k)).filter(x => x != null);
+    if (v.length) sum.push(`${metricName(k)} averaged ${f1(mean(v))}.`);
+  }
+  const interp = (rank ? `${rank === 'desc' ? 'Highest' : 'Lowest'} days for ${labels.join(', ')}` : `Days with: ${labels.join(', ')}`) + (rg.label ? ` · ${rg.label}` : ' · all time') + (offset > 0 ? ` · then the following day: ${om.map(metricName).join(', ').toLowerCase()}${oThr ? ' ' + oThr.op + ' ' + oThr.n : ''}` : '');
+  return { ok: true, interp, rows, summary: sum, total, offset };
+}
+
 /* ================= UI ================= */
 if (typeof document !== 'undefined') {
   let tab = 'home', flow = null, more = 'menu';
   let histMonth = todayStr().slice(0, 7), histMetric = 'morning', selDay = todayStr();
-  let insRange = 30, insKey = 'morning', repDays = 30, voiceText = '', voiceDraft = null, evPreset = 'relapse', evDate = null, toastT;
+  let insRange = 30, insKey = 'morning', repDays = 30, voiceText = '', sqText = '', voiceDraft = null, evPreset = 'relapse', evDate = null, toastT;
   const armed = {};
   const root = document.getElementById('app');
   const $ = s => document.querySelector(s);
@@ -473,11 +620,31 @@ if (typeof document !== 'undefined') {
   function render(keep) {
     document.body.classList.toggle('flowing', !!flow);
     document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-    root.innerHTML = flow ? vFlow() : ({ home: vHome, history: vHistory, insights: vInsights, more: vMore })[tab]();
+    root.innerHTML = flow ? vFlow() : ({ home: vHome, history: vHistory, insights: vInsights, search: vSearch, more: vMore })[tab]();
     if (!keep) window.scrollTo(0, 0);
   }
 
   const syncBadge = () => { const S = Sync.st; if (!S.on) return ''; return `<small class="sb">☁️ ${Sync.err ? 'Sync paused' : S.last ? 'Synced ' + new Date(S.last).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : 'Syncing…'}</small>`; };
+
+  /* ---------- SEARCH ---------- */
+  const SEARCH_EX = ['When did I run and how was the next day?', 'Morning pain above 6 after hot days', 'Worst fatigue last month', 'Days I was stressed about work', 'When did I miss a dose and how was the next morning?', 'Poor sleep and the day after', 'When was my last relapse?'];
+  function vSearch() {
+    const r = sqText.trim() ? runSearch(sqText) : null;
+    const res = !r ? `<p class="hint">Ask in your own words. Everything is searched on this device, nothing is sent anywhere. Your notes are searched too, so mention things like running in your daily notes or voice log.</p>
+        <div class="chips">${SEARCH_EX.map((x, i) => `<button class="chip" data-a="sex" data-v="${i}">${esc(x)}</button>`).join('')}</div>`
+      : !r.ok ? `<p class="hint">${esc(r.msg)}</p>`
+      : `<p class="hint">${esc(r.interp)}</p>${r.summary.map((x, i) => i === 0 ? `<p class="sum"><b>${esc(x)}</b></p>` : `<p class="sum">${esc(x)}</p>`).join('')}
+        ${r.rows.length ? r.rows.slice().reverse().map(x => `<button class="res" data-a="day" data-v="${x.date}">
+          <span class="rd">${esc(fmtDate(x.date, true))}</span>
+          ${x.own.length ? `<span class="rv">${x.own.map(o => `${esc(o.n)} <b>${f1(o.v)}</b>`).join(' · ')}</span>` : ''}
+          ${x.after ? `<span class="rv ${x.after.hit === true ? 'up' : ''}">${esc(fmtDate(x.after.date))}: ${x.after.vals.map(o => `${esc(o.n)} <b>${o.v == null ? '–' : f1(o.v)}</b>`).join(' · ')}${x.after.hit === true ? ' ✓' : ''}</span>` : ''}
+          ${x.note ? `<span class="rn">${esc(x.note)}</span>` : ''}</button>`).join('') : '<p class="hint">Nothing matched. Try a wider time range or fewer details.</p>'}
+        <p class="hint">This shows patterns in your own entries. It does not prove cause and effect.</p>`;
+    return `<header class="top"><div><small>Search your entries</small><h1>Search</h1></div></header>
+    <section class="card"><textarea id="qtext" rows="2" data-in="qtext" placeholder="e.g. When did I run and how was the next day?">${esc(sqText)}</textarea>
+      <div class="row2"><button class="btn mic" data-a="dict" data-v="qtext">🎤 Ask by voice</button><button class="btn pri" data-a="dosearch">Search</button></div></section>
+    <section class="card">${res}</section>`;
+  }
   /* ---------- HOME ---------- */
   function vHome() {
     const t = todayStr(), e = entry(t), ed = eveningDate(), ee = entry(ed);
@@ -782,13 +949,14 @@ if (typeof document !== 'undefined') {
     toast('Listening…');
     r.onresult = ev => { ta.value = base + Array.from(ev.results).map(x => x[0].transcript).join(' '); onInput(ta.dataset.in, ta); };
     r.onerror = ev => toast(/not-allowed/.test(ev.error) ? 'Microphone blocked. Use the keyboard mic instead.' : 'Dictation stopped. Try the keyboard mic.');
-    r.onend = () => { if (id === 'vtext' && ta.value.trim()) act('vreview'); };
+    r.onend = () => { if (id === 'vtext' && ta.value.trim()) act('vreview'); else if (id === 'qtext' && ta.value.trim()) act('dosearch'); };
     try { r.start(); } catch (e) { toast('Use the microphone on your keyboard.'); }
   }
 
   /* ---------- input + actions ---------- */
   function onInput(kind, el) {
     if (kind === 'vtext') voiceText = el.value;
+    else if (kind === 'qtext') sqText = el.value;
     else if (kind === 'note' && flow) { ensure(flow.date).note = el.value; save(); }
     else if (kind === 'questions') { store.questions = el.value; save(); const r = $('#rep'); if (r) r.textContent = reportText(repDays); }
   }
@@ -818,6 +986,8 @@ if (typeof document !== 'undefined') {
       case 'fac': e[v] = !e[v]; save(); render(true); break;
       case 'meds': { const val = v === '1'; e.meds = e.meds === val ? undefined : val; save(); render(true); break; }
       case 'dict': dictate(v); break;
+      case 'dosearch': { const q = $('#qtext'); if (q) sqText = q.value; render(true); break; }
+      case 'sex': sqText = SEARCH_EX[+v]; render(true); break;
       case 'vreview': { const txt = ($('#vtext') || {}).value || voiceText; voiceText = txt; if (!txt.trim()) { toast('Say or type something first'); return; }
         const p = parseText(txt); const onlyMorning = Object.keys(p.s).every(k => k === 'morning') && p.stress == null && !p.why && p.heat == null && p.exercise == null && p.meds == null && p.ill == null && p.alcohol == null;
         voiceDraft = { p, date: onlyMorning ? todayStr() : eveningDate(), text: txt }; render(true); break; }
@@ -868,7 +1038,7 @@ if (typeof document !== 'undefined') {
     r.onload = () => { try { const o = JSON.parse(r.result); if (!o || typeof o.entries !== 'object') throw 0; if (Sync.st.on) { const b = migrate(o), cur = store; b.entries = Object.assign({}, cur.entries, b.entries); const ids = new Set(b.events.map(x => x.id)); b.events = b.events.concat(cur.events.filter(x => !ids.has(x.id))); b.settings.lastBackup = cur.settings.lastBackup; store = b; save(); toast('Backup merged with your current data'); } else { store = migrate(o); save(); toast('Backup restored'); } render(); } catch (x) { toast('That file is not a valid backup'); } };
     r.readAsText(f);
   });
-  root.addEventListener('keydown', ev => { if (ev.key === 'Enter' && (ev.target.id === 'newwhy' || ev.target.id === 'newsym')) { ev.preventDefault(); act(ev.target.id === 'newwhy' ? 'addwhy' : 'addsym'); } });
+  root.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey && ev.target.id === 'qtext') { ev.preventDefault(); act('dosearch'); return; } if (ev.key === 'Enter' && (ev.target.id === 'newwhy' || ev.target.id === 'newsym')) { ev.preventDefault(); act(ev.target.id === 'newwhy' ? 'addwhy' : 'addsym'); } });
   document.querySelectorAll('nav button').forEach(b => b.onclick = () => { tab = b.dataset.tab; if (tab === 'more') more = 'menu'; if (tab === 'history') selDay = selDay || todayStr(); render(); });
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   try { if ('serviceWorker' in navigator && /^https?:/.test(location.protocol) && !/claude|usercontent/.test(location.hostname)) navigator.serviceWorker.register('sw.js').catch(() => {}); } catch (e) {}
@@ -885,4 +1055,4 @@ if (typeof document !== 'undefined') {
   } else if (Sync.st.on) setTimeout(bootSync, 600);
   render();
 }
-if (typeof module !== 'undefined') module.exports = { parseText, patterns, reportText, csv, migrate, Sync, SYNC0, doSync, markChanges, localItems, deriveKey, encWith, decWith, hash, stable, persist, setPassphrase, fbErr, _set: s => { store = migrate(s); }, _get: () => store };
+if (typeof module !== 'undefined') module.exports = { parseQuery: runSearch, runSearch, _store: () => store, parseText, patterns, reportText, csv, migrate, Sync, SYNC0, doSync, markChanges, localItems, deriveKey, encWith, decWith, hash, stable, persist, setPassphrase, fbErr, _set: s => { store = migrate(s); }, _get: () => store };
